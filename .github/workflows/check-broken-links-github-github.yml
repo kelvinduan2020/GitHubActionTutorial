@@ -1,67 +1,91 @@
-name: 'Link Checker: All English'
+name: Check Broken Docs Links in github/github
 
-# **What it does**: Renders the content of every page and check all internal links.
-# **Why we have it**: To make sure all links connect correctly.
-# **Who does it impact**: Docs content.
+# **What it does**: This checks for any broken docs.github.com links in github/github
+# **Why we have it**: Make sure all docs in github/github are up to date
+# **Who does it impact**: Docs engineering, people on GitHub
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
-  pull_request:
+  schedule:
+    - cron: '20 16 * * 1' # Run every Monday at 16:20 UTC / 8:20 PST
 
 permissions:
   contents: read
-  # Needed for the 'trilom/file-changes-action' action
-  pull-requests: read
 
-# This allows a subsequently queued workflow run to interrupt previous runs
-concurrency:
-  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
-  cancel-in-progress: true
+# **IMPORTANT:** Do not change the FREEZE environment variable set here!
+# This workflow runs on a recurring basis. To temporarily disable it (e.g.,
+# during a docs deployment freeze), add an Actions Secret to the repo settings
+# called `FREEZE` with a value of `true`. To re-enable workflow, simply
+# delete that Secret from the repo settings. The environment variable here
+# will duplicate that Secret's value for later evaluation.
+env:
+  FREEZE: ${{ secrets.FREEZE }}
 
 jobs:
-  check-links:
-    runs-on: ${{ fromJSON('["ubuntu-latest", "self-hosted"]')[github.repository == 'github/docs-internal'] }}
+  check_github_github_links:
+    if: github.repository == 'github/docs-internal'
+    runs-on: ubuntu-latest
+    env:
+      # need to use a token from a user with access to github/github for this step
+      GITHUB_TOKEN: ${{ secrets.DOCS_BOT_FR }}
+      FIRST_RESPONDER_PROJECT: Docs content first responder
+      REPORT_AUTHOR: docubot
+      REPORT_LABEL: github github broken link report
+      REPORT_REPOSITORY: github/docs-content
     steps:
+      - if: ${{ env.FREEZE == 'true' }}
+        run: |
+          echo 'The repo is currently frozen! Exiting this workflow.'
+          exit 1 # prevents further steps from running
+
       - name: Checkout
-        uses: actions/checkout@v3
-
-      - name: Setup node
-        uses: actions/setup-node@v3
+        uses: actions/checkout@93ea575cb5d8a053eaa0ac8fa3b40d7e05a33cc8
         with:
-          node-version: 16.13.x
-          cache: npm
+          # To prevent issues with cloning early access content later
+          persist-credentials: 'false'
 
-      - name: Install
-        run: npm ci
+      - uses: ./.github/actions/node-npm-setup
 
-      # Creates file "$/files.json", among others
-      - name: Gather files changed
-        uses: trilom/file-changes-action@a6ca26c14274c33b15e6499323aac178af06ad4b
+      - uses: ./.github/actions/get-docs-early-access
         with:
-          fileOutput: 'json'
+          token: ${{ secrets.DOCUBOT_REPO_PAT }}
 
-      # For verification
-      - name: Show files changed
-        run: cat $HOME/files.json
+      - name: Build server
+        run: npm run build
 
-      - name: Link check (warnings, changed files)
+      - name: Start server in the background
+        env:
+          NODE_ENV: production
+          PORT: 4000
         run: |
-          ./script/rendered-content-link-checker.mjs \
-            --language en \
-            --max 100 \
-            --check-anchors \
-            --check-images \
-            --verbose \
-            --list $HOME/files.json
 
-      - name: Link check (critical, all files)
+          node server.js &
+          sleep 5
+          curl --retry-connrefused --retry 3 -I http://localhost:4000/
+
+      - name: Run broken github/github link check
         run: |
-          ./script/rendered-content-link-checker.mjs \
-            --language en \
-            --exit \
-            --verbose \
-            --check-images \
-            --level critical
+          script/check-github-github-links.js > broken_github_github_links.md
+
+      # check-github-github-links.js returns 0 if no links are broken, and 1 if any links
+      # are broken. When an Actions step's exit code is 1, the action run's job status
+      # is failure and the run ends. The following steps create an issue for the
+      # broken link report only if any links are broken, so `if: ${{ failure() }}`
+      # ensures the steps run despite the previous step's failure of the job.
+      #
+      # https://docs.github.com/actions/reference/context-and-expression-syntax-for-github-actions#job-status-check-functions
+
+      - if: ${{ failure() && env.FREEZE != 'true' }}
+        name: Get title for issue
+        id: check
+        run: echo "title=$(head -1 broken_github_github_links.md)" >> $GITHUB_OUTPUT
+      - if: ${{ failure() && env.FREEZE != 'true'}}
+        name: Create issue from file
+        id: github-github-broken-link-report
+        uses: peter-evans/create-issue-from-file@433e51abf769039ee20ba1293a088ca19d573b7f
+        with:
+          token: ${{ env.GITHUB_TOKEN }}
+          title: ${{ steps.check.outputs.title }}
+          content-filepath: ./broken_github_github_links.md
+          repository: ${{ env.REPORT_REPOSITORY }}
+          labels: ${{ env.REPORT_LABEL }}
